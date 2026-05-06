@@ -1,6 +1,6 @@
 import os
 import json
-from datetime import datetime
+import logging
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -9,37 +9,46 @@ from linebot.models import (
     QuickReply, QuickReplyButton, MessageAction
 )
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
+
+# 設定日誌等級，方便在 Render 的 Logs 查看錯誤
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# --- 環境變數與設定 ---
+# --- 環境變數讀取 ---
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
-creds_json = os.environ.get('GOOGLE_CREDENTIALS_JSON')
+# 支援兩種可能的變數名稱
+GOOGLE_JSON_STR = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON') or os.environ.get('GOOGLE_CREDENTIALS_JSON')
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 初始化 Google Sheets
-try:
-    info = json.loads(creds_json)
-    scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    creds = Credentials.from_service_account_info(info, scopes=scope)
-    gc = gspread.authorize(creds)
-    sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
-except Exception as e:
-    print(f"Google Sheets 初始化失敗: {e}")
+# --- 台灣行政區數據 (部分示範，請補足完整) ---
+TAIWAN_DATA = {
+    "台北市": ["中正區", "萬華區", "大同區", "中山區", "松山區", "大安區", "信義區", "內湖區", "南港區", "士林區", "北投區", "文山區"],
+    "新北市": ["板橋區", "三重區", "中和區", "永和區", "新莊區", "新店區", "樹林區", "鶯歌區", "三峽區", "淡水區", "汐止區", "瑞芳區", "土城區", "蘆洲區", "五股區", "泰山區", "林口區", "深坑區", "石碇區", "坪林區", "三芝區", "石門區", "八里區", "平溪區", "雙溪區", "貢寮區", "金山區", "萬里區", "烏來區"],
+    "桃園市": ["桃園區", "中壢區", "大溪區", "楊梅區", "蘆竹區", "大園區", "龜山區", "八德區", "龍潭區", "平鎮區", "新屋區", "觀音區", "復興區"],
+    # ... 其餘縣市請按此格式補齊
+}
 
-# 縣市資料分頁處理
-COUNTIES_P1 = ["臺北市", "新北市", "桃園市", "臺中市", "臺南市", "高雄市", "基隆市", "新竹縣", "新竹市", "苗栗縣", "彰化縣"]
-COUNTIES_P2 = ["南投縣", "雲林縣", "嘉義縣", "嘉義市", "屏東縣", "宜蘭縣", "花蓮縣", "臺東縣", "澎湖縣", "金門縣", "連江縣"]
+# 狀態暫存（實務上建議使用 Redis 或資料庫）
+user_states = {}
 
-# 狀態管理
-user_sessions = {}
+def get_gspread_client():
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds_dict = json.loads(GOOGLE_JSON_STR)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        return gspread.authorize(creds)
+    except Exception as e:
+        logger.error(f"Google Sheets 認證失敗: {e}")
+        return None
 
-@app.route("/callback", method=['POST'])
+@app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
@@ -49,65 +58,64 @@ def callback():
         abort(400)
     return 'OK'
 
-def get_county_quick_reply(page=1):
-    items = []
-    target_list = COUNTIES_P1 if page == 1 else COUNTIES_P2
-    
-    for c in target_list:
-        items.append(QuickReplyButton(action=MessageAction(label=c, text=c)))
-    
-    if page == 1:
-        items.append(QuickReplyButton(action=MessageAction(label="➡️ 下一頁", text="下一頁")))
-    else:
-        items.append(QuickReplyButton(action=MessageAction(label="⬅️ 回首頁", text="回首頁")))
-    
-    return QuickReply(items=items)
-
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
-
-    if text == "重新填寫" or user_id not in user_sessions:
-        user_sessions[user_id] = {'state': 'ASK_NAME'}
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="您好！請問您的姓名是？"))
+    
+    if user_id not in user_states:
+        user_states[user_id] = {"step": "ASK_NAME"}
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="您好！請輸入您的姓名以開始填寫問卷："))
         return
 
-    state = user_sessions[user_id].get('state')
+    state = user_states[user_id]
 
-    if state == 'ASK_NAME':
-        user_sessions[user_id]['name'] = text
-        user_sessions[user_id]['state'] = 'ASK_COUNTY'
-        reply_text = f"{text} 您好！請選擇您所在的【縣市】？"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text, quick_reply=get_county_quick_reply(1)))
+    if state["step"] == "ASK_NAME":
+        state["name"] = text
+        state["step"] = "ASK_CITY"
+        cities = list(TAIWAN_DATA.keys())
+        buttons = [QuickReplyButton(action=MessageAction(label=c, text=c)) for c in cities[:13]]
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"{text} 您好，請選擇您居住的縣市：",
+            quick_reply=QuickReply(items=buttons)
+        ))
 
-    elif state == 'ASK_COUNTY':
-        if text == "下一頁":
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請選擇縣市（第 2 頁）：", quick_reply=get_county_quick_reply(2)))
-        elif text == "回首頁":
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請選擇縣市（第 1 頁）：", quick_reply=get_county_quick_reply(1)))
+    elif state["step"] == "ASK_CITY":
+        if text in TAIWAN_DATA:
+            state["city"] = text
+            state["step"] = "ASK_DISTRICT"
+            districts = TAIWAN_DATA[text]
+            
+            # --- 關鍵修正：解決 Quick Reply 13 個上限問題 ---
+            display_districts = districts[:12]
+            buttons = [QuickReplyButton(action=MessageAction(label=d, text=d)) for d in display_districts]
+            if len(districts) > 12:
+                buttons.append(QuickReplyButton(action=MessageAction(label="其他/請手打", text="請直接輸入區名")))
+            
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"請選擇 {text} 的行政區：",
+                quick_reply=QuickReply(items=buttons)
+            ))
         else:
-            user_sessions[user_id]['county'] = text
-            user_sessions[user_id]['state'] = 'ASK_DISTRICT'
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"好的，那【{text}】的哪個【鄉鎮市區】呢？"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請從下方選單選擇正確的縣市。"))
 
-    elif state == 'ASK_DISTRICT':
-        user_sessions[user_id]['district'] = text
-        name = user_sessions[user_id]['name']
-        county = user_sessions[user_id]['county']
-        
+    elif state["step"] == "ASK_DISTRICT":
+        state["district"] = text
+        # 準備寫入試算表
         try:
-            # 嘗試寫入 Google Sheets
-            sheet.append_row([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                name, county, text
-            ])
-            reply_text = f"完成！已記錄您的資訊：\n姓名：{name}\n地點：{county}{text}\n感謝您的填寫！"
-            del user_sessions[user_id]
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            client = get_gspread_client()
+            if client:
+                sh = client.open_by_key(SPREADSHEET_ID)
+                worksheet = sh.get_worksheet(0)
+                worksheet.append_row([state["name"], state["city"], state["district"]])
+                
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="資料已成功記錄！謝謝您的填寫。"))
+                del user_states[user_id] # 完成後清除狀態
+            else:
+                raise Exception("無法取得 Google Sheets 客戶端")
         except Exception as e:
-            print(f"寫入試算表錯誤: {e}") # 這會在 Render 的 Logs 顯示
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="系統繁忙（寫入失敗），請確認試算表共用權限或稍後再試。"))
+            logger.error(f"寫入試算表錯誤: {e}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="抱歉，系統暫時無法存取試算表，請稍後再試。"))
 
 if __name__ == "__main__":
-    app.run()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
