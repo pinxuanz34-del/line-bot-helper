@@ -4,7 +4,7 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage, 
+    MessageEvent, TextMessage, TextSendMessage, FollowEvent,
     QuickReply, QuickReplyButton, MessageAction
 )
 import gspread
@@ -13,11 +13,11 @@ from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
-# --- 使用您原本在 Render 設定的環境變數名稱 ---
+# --- 環境變數 ---
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
-SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')  # 確保與 Render 一致
-GOOGLE_CREDENTIALS_JSON = os.environ.get('GOOGLE_CREDENTIALS_JSON') # 確保與 Render 一致
+SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
+GOOGLE_CREDENTIALS_JSON = os.environ.get('GOOGLE_CREDENTIALS_JSON')
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -33,7 +33,7 @@ TAIWAN_DATA = {
     "基隆市": ["仁愛區", "信義區", "中正區", "中山區", "安樂區", "暖暖區", "七堵區"],
     "新竹市": ["東區", "北區", "香山區"],
     "新竹縣": ["竹北市", "竹東鎮", "新埔鎮", "關西鎮", "湖口鄉", "新豐鄉", "芎林鄉", "橫山鄉", "北埔鄉", "寶山鄉", "峨眉鄉", "尖石鄉", "五峰鄉"],
-    "苗栗縣": ["苗栗市", "頭份市", "竹南鎮", "後龍鎮", "通霄鎮", "苑裡鎮", "苗栗鎮", "造橋鄉", "西湖鄉", "頭屋鄉", "公館鄉", "銅鑼鄉", "三義鄉", "大湖鄉", "獅潭鄉", "三灣鄉", "南庄鄉", "卓蘭鎮"],
+    "苗栗縣": ["苗栗市", "頭份市", "竹南鎮", "後龍鎮", "通霄鎮", "苑裡鎮", "造橋鄉", "西湖鄉", "頭屋鄉", "公館鄉", "銅鑼鄉", "三義鄉", "大湖鄉", "獅潭鄉", "三灣鄉", "南庄鄉", "卓蘭鎮"],
     "彰化縣": ["彰化市", "鹿港鎮", "和美鎮", "線西鄉", "伸港鄉", "福興鄉", "秀水鄉", "花壇鄉", "芬園鄉", "員林市", "溪湖鎮", "田中鎮", "大村鄉", "埔鹽鄉", "埔心鄉", "永靖鄉", "社頭鄉", "二水鄉", "北斗鎮", "二林鎮", "田尾鄉", "埤頭鄉", "芳苑鄉", "大城鄉", "竹塘鄉", "溪州鄉"],
     "南投縣": ["南投市", "埔里鎮", "草屯鎮", "竹山鎮", "集集鎮", "名間鄉", "鹿谷鄉", "中寮鄉", "魚池鄉", "國姓鄉", "水里鄉", "信義鄉", "仁愛鄉"],
     "雲林縣": ["斗六市", "斗南鎮", "虎尾鎮", "西螺鎮", "土庫鎮", "北港鎮", "古坑鄉", "大埤鄉", "莿桐鄉", "林內鄉", "二崙鄉", "崙背鄉", "麥寮鄉", "東勢鄉", "褒忠鄉", "台西鄉", "元長鄉", "四湖鄉", "口湖鄉", "水林鄉"],
@@ -53,95 +53,117 @@ user_states = {}
 def get_google_worksheet():
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        if not GOOGLE_CREDENTIALS_JSON:
-            print("Error: GOOGLE_CREDENTIALS_JSON is empty!")
-            return None
         creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
         return client.open_by_key(SPREADSHEET_ID).sheet1
-    except Exception as e:
-        print(f"Google Sheets Auth Error: {e}")
-        return None
+    except: return None
+
+def get_city_options(page=0):
+    cities = list(TAIWAN_DATA.keys())
+    start = page * 11
+    end = start + 11
+    current_cities = cities[start:end]
+    items = [QuickReplyButton(action=MessageAction(label=c, text=c)) for c in current_cities]
+    
+    if end < len(cities):
+        items.append(QuickReplyButton(action=MessageAction(label="更多縣市 ➔", text="更多縣市")))
+    if page > 0:
+        items.append(QuickReplyButton(action=MessageAction(label="⬅ 回前頁", text="回前頁")))
+    return QuickReply(items=items)
 
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
+    try: handler.handle(body, signature)
+    except InvalidSignatureError: abort(400)
     return 'OK'
+
+# --- 1. 新增：加入好友即自動歡迎與引導 ---
+@handler.add(FollowEvent)
+def handle_follow(event):
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(
+            text="感謝您加入！請點擊下方按鈕或輸入「我要報名」來開始建立您的資料。",
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=MessageAction(label="點我開始報名", text="我要報名"))
+            ])
+        )
+    )
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
 
-    # 支援重新開始
-    if text == "重新開始":
-        user_states.pop(user_id, None)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已重置。請輸入您的姓名："))
+    # --- 2. 觸發報名邏輯 ---
+    if text in ["重新開始", "我要報名"]:
+        user_states[user_id] = {"step": "ASK_NAME", "city_page": 0}
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="好的，請輸入您的姓名："))
         return
 
-    if user_id not in user_states:
-        user_states[user_id] = {"step": "ASK_NAME"}
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="您好！請輸入您的姓名："))
+    # 3. 如果狀態是 FINISHED，且不是要重新開始，則不回覆
+    if user_id in user_states and user_states[user_id].get("step") == "FINISHED":
         return
+
+    # --- 4. 自動偵測：非認識的訊息也自動啟動報名 ---
+    if user_id not in user_states:
+        user_states[user_id] = {"step": "ASK_NAME", "city_page": 0}
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="您好！偵測到您尚未建立資料，請先輸入您的姓名："))
+        return 
 
     state = user_states[user_id]
 
     if state["step"] == "ASK_NAME":
         state["name"] = text
         state["step"] = "ASK_CITY"
-        cities = list(TAIWAN_DATA.keys())
-        # 顯示前 12 個縣市
-        items = [QuickReplyButton(action=MessageAction(label=c, text=c)) for c in cities[:12]]
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"{text} 您好！請選擇居住縣市：",
-            quick_reply=QuickReply(items=items)
+            quick_reply=get_city_options(0)
         ))
 
     elif state["step"] == "ASK_CITY":
-        if text in TAIWAN_DATA:
+        if text == "更多縣市":
+            state["city_page"] += 1
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請選擇縣市：", quick_reply=get_city_options(state["city_page"])))
+        elif text == "回前頁":
+            state["city_page"] -= 1
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請選擇縣市：", quick_reply=get_city_options(state["city_page"])))
+        elif text in TAIWAN_DATA:
             state["city"] = text
             state["step"] = "ASK_DISTRICT"
             districts = TAIWAN_DATA[text]
             items = [QuickReplyButton(action=MessageAction(label=d, text=d)) for d in districts[:11]]
             items.append(QuickReplyButton(action=MessageAction(label="其他/請手打", text="請直接輸入區名")))
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text=f"請選擇 {text} 的行政區：",
-                quick_reply=QuickReply(items=items)
+                text=f"請選擇 {text} 的行政區：", quick_reply=QuickReply(items=items)
             ))
         else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請由選單選擇縣市。"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請由選單選擇縣市。", quick_reply=get_city_options(state["city_page"])))
 
     elif state["step"] == "ASK_DISTRICT":
-        # 修正 1：攔截按鈕文字，不讓它寫入
         if text == "請直接輸入區名":
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="好的，請直接「手打」輸入您的行政區名稱："))
-            return # 保持在 ASK_DISTRICT 狀態
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"好的，請直接輸入「{state['city']}」的行政區名稱："))
+            return
+
+        valid_districts = TAIWAN_DATA.get(state["city"], [])
+        if text not in valid_districts:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"❌ 錯誤：『{text}』似乎不屬於『{state['city']}』。\n請重新輸入正確的行政區（例如：{valid_districts[0]}）："
+            ))
+            return
 
         state["district"] = text
         worksheet = get_google_worksheet()
-        
         if worksheet:
-            try:
-                # 修正 2：時間、User ID、姓名、縣市、鄉鎮市區
-                tw_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
-                row = [tw_time, user_id, state["name"], state["city"], state["district"]]
-                worksheet.append_row(row)
-                
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                    text=f"✅ 成功寫入！\n時間：{tw_time}\n姓名：{state['name']}\n區域：{state['city']}{state['district']}"
-                ))
-                del user_states[user_id]
-            except Exception as e:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 寫入錯誤：{str(e)[:50]}"))
+            tw_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+            worksheet.append_row([tw_time, user_id, state["name"], state["city"], state["district"]])
+            state["step"] = "FINISHED"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已收到您的相關資料，謝謝"))
         else:
-            # 這裡如果是 None，代表連認證都沒過
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 系統認證失敗，請檢查環境變數名稱是否正確。"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 系統暫時無法存取試算表。"))
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
